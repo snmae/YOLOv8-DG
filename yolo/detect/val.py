@@ -33,11 +33,10 @@ class DetectionValidator(BaseValidator):
         super().__init__(dataloader, save_dir, pbar, args, _callbacks)
         self.nt_per_class = None
         self.is_coco = False
-        self.is_lvis = False
         self.class_map = None
         self.args.task = "detect"
         self.metrics = DetMetrics(save_dir=self.save_dir, on_plot=self.on_plot)
-        self.iouv = torch.linspace(0.5, 0.95, 10)  # IoU vector for mAP@0.5:0.95
+        self.iouv = torch.linspace(0.5, 0.95, 10)  # iou vector for mAP@0.5:0.95
         self.niou = self.iouv.numel()
         self.lb = []  # for autolabelling
 
@@ -67,9 +66,8 @@ class DetectionValidator(BaseValidator):
         """Initialize evaluation metrics for YOLO."""
         val = self.data.get(self.args.split, "")  # validation path
         self.is_coco = isinstance(val, str) and "coco" in val and val.endswith(f"{os.sep}val2017.txt")  # is COCO
-        self.is_lvis = isinstance(val, str) and "lvis" in val and not self.is_coco  # is LVIS
-        self.class_map = converter.coco80_to_coco91_class() if self.is_coco else list(range(len(model.names)))
-        self.args.save_json |= (self.is_coco or self.is_lvis) and not self.training  # run on final val if training COCO
+        self.class_map = converter.coco80_to_coco91_class() if self.is_coco else list(range(1000))
+        self.args.save_json |= self.is_coco and not self.training  # run on final val if training COCO
         self.names = model.names
         self.nc = len(model.names)
         self.metrics.names = self.names
@@ -81,7 +79,7 @@ class DetectionValidator(BaseValidator):
 
     def get_desc(self):
         """Return a formatted string summarizing class metrics of YOLO model."""
-        return ("%22s" + "%11s" * 6) % ("Class", "Images", "Instances", "Box(P", "R", "mAP50", "mAP50-95)")
+        return ('%22s' + '%11s' * 8) % ('Class', 'Images', 'Instances', 'Box(P', 'R', 'mAP50','mAP75','mAP90', 'mAP50-95)')
 
     def postprocess(self, preds):
         """Apply Non-maximum suppression to prediction outputs."""
@@ -106,7 +104,7 @@ class DetectionValidator(BaseValidator):
         if len(cls):
             bbox = ops.xywh2xyxy(bbox) * torch.tensor(imgsz, device=self.device)[[1, 0, 1, 0]]  # target boxes
             ops.scale_boxes(imgsz, bbox, ori_shape, ratio_pad=ratio_pad)  # native-space labels
-        return {"cls": cls, "bbox": bbox, "ori_shape": ori_shape, "imgsz": imgsz, "ratio_pad": ratio_pad}
+        return dict(cls=cls, bbox=bbox, ori_shape=ori_shape, imgsz=imgsz, ratio_pad=ratio_pad)
 
     def _prepare_pred(self, pred, pbatch):
         """Prepares a batch of images and annotations for validation."""
@@ -134,7 +132,8 @@ class DetectionValidator(BaseValidator):
                 if nl:
                     for k in self.stats.keys():
                         self.stats[k].append(stat[k])
-                    if self.args.plots:
+                    # TODO: obb has not supported confusion_matrix yet.
+                    if self.args.plots and self.args.task != "obb":
                         self.confusion_matrix.process_batch(detections=None, gt_bboxes=bbox, gt_cls=cls)
                 continue
 
@@ -148,7 +147,8 @@ class DetectionValidator(BaseValidator):
             # Evaluate
             if nl:
                 stat["tp"] = self._process_batch(predn, bbox, cls)
-                if self.args.plots:
+                # TODO: obb has not supported confusion_matrix yet.
+                if self.args.plots and self.args.task != "obb":
                     self.confusion_matrix.process_batch(predn, bbox, cls)
             for k in self.stats.keys():
                 self.stats[k].append(stat[k])
@@ -173,7 +173,7 @@ class DetectionValidator(BaseValidator):
         self.nt_per_class = np.bincount(
             stats["target_cls"].astype(int), minlength=self.nc
         )  # number of targets per class
-        return self.metrics.results_dict,self.metrics.box
+        return self.metrics.results_dict
 
     def print_results(self):
         """Prints training/validation set metrics per class."""
@@ -183,7 +183,7 @@ class DetectionValidator(BaseValidator):
             LOGGER.warning(f"WARNING ⚠️ no labels found in {self.args.task} set, can not compute metrics without labels")
 
         # Print results per class
-        if self.args.verbose and not self.training and self.nc > 1 and len(self.stats):
+        if self.args.verbose and self.nc > 1 and len(self.stats):
             for i, c in enumerate(self.metrics.ap_class_index):
                 LOGGER.info(pf % (self.names[c], self.seen, self.nt_per_class[c], *self.metrics.class_result(i)))
 
@@ -268,8 +268,7 @@ class DetectionValidator(BaseValidator):
             self.jdict.append(
                 {
                     "image_id": image_id,
-                    "category_id": self.class_map[int(p[5])]
-                    + (1 if self.is_lvis else 0),  # index starts from 1 if it's lvis
+                    "category_id": self.class_map[int(p[5])],
                     "bbox": [round(x, 3) for x in b],
                     "score": round(p[4], 5),
                 }
@@ -277,42 +276,26 @@ class DetectionValidator(BaseValidator):
 
     def eval_json(self, stats):
         """Evaluates YOLO output in JSON format and returns performance statistics."""
-        if self.args.save_json and (self.is_coco or self.is_lvis) and len(self.jdict):
+        if self.args.save_json and self.is_coco and len(self.jdict):
+            anno_json = self.data["path"] / "annotations/instances_val2017.json"  # annotations
             pred_json = self.save_dir / "predictions.json"  # predictions
-            anno_json = (
-                self.data["path"]
-                / "annotations"
-                / ("instances_val2017.json" if self.is_coco else f"lvis_v1_{self.args.split}.json")
-            )  # annotations
-            pkg = "pycocotools" if self.is_coco else "lvis"
-            LOGGER.info(f"\nEvaluating {pkg} mAP using {pred_json} and {anno_json}...")
+            LOGGER.info(f"\nEvaluating pycocotools mAP using {pred_json} and {anno_json}...")
             try:  # https://github.com/cocodataset/cocoapi/blob/master/PythonAPI/pycocoEvalDemo.ipynb
-                for x in pred_json, anno_json:
+                check_requirements("pycocotools>=2.0.6")
+                from pycocotools.coco import COCO  # noqa
+                from pycocotools.cocoeval import COCOeval  # noqa
+
+                for x in anno_json, pred_json:
                     assert x.is_file(), f"{x} file not found"
-                check_requirements("pycocotools>=2.0.6" if self.is_coco else "lvis>=0.5.3")
+                anno = COCO(str(anno_json))  # init annotations api
+                pred = anno.loadRes(str(pred_json))  # init predictions api (must pass string, not Path)
+                eval = COCOeval(anno, pred, "bbox")
                 if self.is_coco:
-                    from pycocotools.coco import COCO  # noqa
-                    from pycocotools.cocoeval import COCOeval  # noqa
-
-                    anno = COCO(str(anno_json))  # init annotations api
-                    pred = anno.loadRes(str(pred_json))  # init predictions api (must pass string, not Path)
-                    eval = COCOeval(anno, pred, "bbox")
-                else:
-                    from lvis import LVIS, LVISEval
-
-                    anno = LVIS(str(anno_json))  # init annotations api
-                    pred = anno._load_json(str(pred_json))  # init predictions api (must pass string, not Path)
-                    eval = LVISEval(anno, pred, "bbox")
-                eval.params.imgIds = [int(Path(x).stem) for x in self.dataloader.dataset.im_files]  # images to eval
+                    eval.params.imgIds = [int(Path(x).stem) for x in self.dataloader.dataset.im_files]  # images to eval
                 eval.evaluate()
                 eval.accumulate()
                 eval.summarize()
-                if self.is_lvis:
-                    eval.print_results()  # explicitly call print_results
-                # update mAP50-95 and mAP50
-                stats[self.metrics.keys[-1]], stats[self.metrics.keys[-2]] = (
-                    eval.stats[:2] if self.is_coco else [eval.results["AP50"], eval.results["AP"]]
-                )
+                stats[self.metrics.keys[-1]],stats[self.metrics.keys[-2]],stats[self.metrics.keys[-3]], stats[self.metrics.keys[-4]] = eval.stats[:4]  # update mAP50-95 and mAP50  # update mAP50-95 and mAP50
             except Exception as e:
-                LOGGER.warning(f"{pkg} unable to run: {e}")
+                LOGGER.warning(f"pycocotools unable to run: {e}")
         return stats

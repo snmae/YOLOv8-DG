@@ -55,11 +55,10 @@ class OBBValidator(DetectionValidator):
         Return correct prediction matrix.
 
         Args:
-            detections (torch.Tensor): Tensor of shape [N, 7] representing detections.
-                Each detection is of the format: x1, y1, x2, y2, conf, class, angle.
-            gt_bboxes (torch.Tensor): Tensor of shape [M, 5] representing rotated boxes.
-                Each box is of the format: x1, y1, x2, y2, angle.
-            labels (torch.Tensor): Tensor of shape [M] representing labels.
+            detections (torch.Tensor): Tensor of shape [N, 6] representing detections.
+                Each detection is of the format: x1, y1, x2, y2, conf, class.
+            labels (torch.Tensor): Tensor of shape [M, 5] representing labels.
+                Each label is of the format: class, x1, y1, x2, y2.
 
         Returns:
             (torch.Tensor): Correct prediction matrix of shape [N, 10] for 10 IoU levels.
@@ -78,7 +77,7 @@ class OBBValidator(DetectionValidator):
         if len(cls):
             bbox[..., :4].mul_(torch.tensor(imgsz, device=self.device)[[1, 0, 1, 0]])  # target boxes
             ops.scale_boxes(imgsz, bbox, ori_shape, ratio_pad=ratio_pad, xywh=True)  # native-space labels
-        return {"cls": cls, "bbox": bbox, "ori_shape": ori_shape, "imgsz": imgsz, "ratio_pad": ratio_pad}
+        return dict(cls=cls, bbox=bbox, ori_shape=ori_shape, imgsz=imgsz, ratio_pad=ratio_pad)
 
     def _prepare_pred(self, pred, pbatch):
         """Prepares and returns a batch for OBB validation with scaled and padded bounding boxes."""
